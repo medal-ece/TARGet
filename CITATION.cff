@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+title: "TARGet: Topology-Aware Fusion-based Radio Frequency Circuit Functional Modeling using Graph Neural Networks"
+description: "TARGet is a topology-aware RF circuit modeling codebase implementing FCN, CCI-NN, GNN, and hybrid CCI+GNN architectures."
+authors:
+  - given-names: Soroosh
+    family-names: Noorzad
+    email: soroosh.noorzad@utah.edu
+    affiliation: "University of Utah, Salt Lake City, Utah, USA"
+  - given-names: Sebastian
+    family-names: Bodero
+    email: sebastian.bodero@utah.edu
+    affiliation: "University of Utah, Salt Lake City, Utah, USA"
+  - given-names: Morteza
+    family-names: Fayazi
+    email: m.fayazi@utah.edu
+    affiliation: "University of Utah, Salt Lake City, Utah, USA"
+type: software
+date-released: 2026-04-14
+keywords:
+  - TARGet
+  - topology-aware
+  - circuit modeling
+  - CCI-NN
+  - GNN
+  - RF
+  - machine learning

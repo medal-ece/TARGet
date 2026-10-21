@@ -1,0 +1,20 @@
+name: target
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10.16
+  - numpy=1.26.4
+  - pandas=2.2.3
+  - scikit-learn=1.3.2
+  - matplotlib=3.8.1
+  - seaborn=0.12.2
+  - tqdm=4.66.5
+  - pip
+  - pip:
+    - tensorflow==2.14.1
+    - keras==2.14.0
+    - prettytable==3.10.0
+    - quantiphy==2.20
+    - spektral==1.3.1
+    - torch-geometric==2.6.1
