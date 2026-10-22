@@ -2,10 +2,20 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![arXiv](https://img.shields.io/badge/arXiv-2609.22165-b31b1b)](https://arxiv.org/abs/2609.22165)
+![Release Type](https://img.shields.io/badge/Release-Code%20Only-lightgrey)
+![Python 3.10](https://img.shields.io/badge/Python-3.10-blue)
 
-TARGet is a topology-aware RF circuit modeling framework for low-noise amplifiers (LNAs) and phase shifters. It combines sub-circuit neural networks with a graph neural network and includes FCNN, CCI-NN, and GNN baselines.
+TARGet is an open-source topology-aware RF circuit modeling framework for RF circuits, including low-noise amplifiers and phase shifters. It combines sub-circuit connectivity-aware models with Graph Neural Networks to support unified learning across multiple circuit topologies.
 
-**Paper:** [TARGet: Topology-Aware Fusion-based Radio Frequency Circuit Functional Modeling using Graph Neural Networks](https://arxiv.org/abs/2609.22165). Citation information is in [CITATION.cff](CITATION.cff).
+## Summary
+
+TARGet is designed for RF functional modeling under limited training data. The method uses:
+
+- S-parameter-based sub-circuit representations
+- explicit topology encoding
+- a fusion-based architecture that combines CCI-style subnetworks and a GNN branch
+
+**Published Paper:** [TARGet: Topology-Aware Fusion-based Radio Frequency Circuit Functional Modeling using Graph Neural Networks](https://arxiv.org/abs/2609.22165). Citation information is in [CITATION.cff](CITATION.cff).
 
 ## Installation
 
@@ -20,18 +30,15 @@ The environment includes TensorFlow/Keras, Spektral, and PyTorch/PyG. For GPU ex
 
 ## Dataset
 
-Datasets are not included because their distribution is restricted by NDA. Place prepared CSV files under:
+This repository contains code only. No dataset, processed data, or derived predictions are included. The dataset is not published because its distribution is restricted under Non-Disclosure Agreement (NDA) protocols.
+
+The expected external dataset layout is:
 
 ```text
 dataset/v1/<architecture>/main/<topology>/
   train_*.csv
   test_*.csv
 ```
-
-| Architecture | Combined topology folder | Targets |
-| --- | --- | --- |
-| `LNA` | `combo_0_1` | `GA`, `GP`, `NF` |
-| `phase_shifter` | `combo_0_1_2_3` | `S11m` |
 
 Each CSV needs a header, frequency in Hz, circuit features, targets, and `topology_index`. S-parameter phases are in degrees. Use the following schemas:
 
@@ -47,7 +54,30 @@ freq w in_s11_abs in_s11_ph in_s12_abs in_s12_ph in_s21_abs in_s21_ph in_s22_abs
 freq s2 s1_s11_abs s1_s11_ph s1_s12_abs s1_s12_ph s1_s21_abs s1_s21_ph s1_s22_abs s1_s22_ph s2_s11_abs s2_s11_ph s2_s12_abs s2_s12_ph s2_s21_abs s2_s21_ph s2_s22_abs s2_s22_ph S11m S21m S21p S22m topology_index
 ```
 
-For LNA, topology IDs are `0` (CS) and `1` (Cascode). For phase shifters, IDs `0`-`3` correspond to switch states `(0,0)`, `(0,1)`, `(1,0)`, and `(1,1)`. Inputs must match these supported circuit structures. Selected frequencies must occur in both the CSVs and [code/freq_list.py](code/freq_list.py).
+Selected frequencies must occur in both the CSVs and [code/freq_list.py](code/freq_list.py).
+
+## Environment
+
+The canonical environment for this release is [`environment.yml`](environment.yml).
+
+Main dependencies:
+
+- Python 3.10
+- TensorFlow / Keras
+- NumPy / pandas / scikit-learn
+- Matplotlib / seaborn
+- Spektral
+- PyTorch Geometric
+
+## Quick Start
+
+```bash
+conda env create -f environment.yml
+conda activate target
+python code/main.py
+```
+
+Before running, place the external dataset under the expected `dataset/` directory and adjust [`code/config.py`](code/config.py) if needed.
 
 ## Run
 
@@ -73,28 +103,25 @@ On headless systems, set `MPLBACKEND=Agg` and `plot_show=False`. Caching can be 
 python code/run_experiment.py
 ```
 
-The default preset, `lna_heldout_primary_10freq`, evaluates GA, GP, and NF at 10 frequencies and full utilization. Controls for targets and models are at the top of [code/run_experiment.py](code/run_experiment.py).
+## Reproducing This Release
 
-Place its prepared data under:
+The default configuration in [`code/config.py`](code/config.py) uses:
 
-```text
-dataset/v2_inf_cap_ind/LNA/
-  main/combo_0_1/       # train_*.csv and test_*.csv
-  heldout/combo_0_1/    # test_*.csv
-```
-
-The primary split holds out `inf_cap_ind` wherever it occurs on either matching side: input IDs 61-63 or output IDs 57-59. The conversion utilities in [code/ds_conv.py](code/ds_conv.py) use the original archive/structured-data conventions; they are unnecessary when the prepared splits are already available. Regeneration can replace existing generated files.
+- `main_arch="LNA"`
+- `model_types=["FCN", "CCI", "GNN", "CCIGNN-Sep"]`
+- `selected_topologies=[0, 1] # Both CS and Cascode`
+- `targets=["GA"] # GP, NF`
+- `freq_mode="uniform"`
+- `freq_count=40`
 
 ## Outputs
 
-- `results/main/`: metrics, predictions, analysis, and diagnostic plots.
-- `weights/main/`: saved models and metadata.
-- Dataset `.cache/` folders: cached inputs when enabled.
+Running `code/main.py` creates experiment outputs under:
 
-MAE/RMSE logs use standardized target units; saved predictions use original units. NMAE divides MAE by the evaluated target range. Timing records distinguish model fitting (`training_time_sec`) from the full experiment loop (`loop_time_sec`).
-
-Repeated runs can append records or reuse weight filenames. Preserve previous outputs when needed. Keep private datasets out of commits: the current `.gitignore` does not exclude `dataset/` or `Files/`.
+- `results/` for logs, CSV summaries, and analysis tables
+- `weights/` for saved models
+- `images/` for generated figures
 
 ## License
 
-[MIT](LICENSE).
+Released under the MIT License. See [LICENSE](LICENSE).
