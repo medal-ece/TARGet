@@ -1,21 +1,23 @@
-# code/analysis/core.py
-"""Core helpers for loading and aggregating experiment results."""
+# analysis/core.py
 from pathlib import Path
 from typing import Union
+import numpy as np
 import pandas as pd
+from config import Config
 
 META_COLS = {
     "timestamp", "experiment_id", "schema_version", "user",
     "model_type", "architecture", "coordinate", "topology",
+    "dataset_version", "dataset_variant", "train_dataset_split", "heldout_dataset_split",
     "frequency", "utilization", "repetition",
     "seed", "optimizer", "learning_rate",
-    "batch_size", "scaler", "loss",
-    "adapter_mode"
+    "batch_size", "scaler", "loss", "loss_function",
+    "adapter_mode", "metrics",
+    "training_time_sec", "model_param_count",
 
 }
 
 def load_runs(csv_path: Union[str, Path]) -> pd.DataFrame:
-    """Load a run log CSV, validate its schema, and normalize metric dtypes."""
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
@@ -23,7 +25,7 @@ def load_runs(csv_path: Union[str, Path]) -> pd.DataFrame:
     metric_cols = [c for c in df.columns if c not in META_COLS]
     if not metric_cols:
         raise ValueError("No metric columns found in CSV.")
-    # Ensure the CSV has the minimum columns needed for downstream analysis.
+    # Basic sanity checks
     required = {"model_type", "frequency", "utilization", "repetition"} | set(metric_cols)
     missing = required - set(df.columns)
     if missing:
@@ -31,7 +33,7 @@ def load_runs(csv_path: Union[str, Path]) -> pd.DataFrame:
             f"Missing required columns in {csv_path.name}: {sorted(missing)}\n"
             f"Found columns: {list(df.columns)}"
         )
-    # Normalize columns that analysis expects to be numeric.
+    # Normalize dtypes
     df["frequency"] = pd.to_numeric(df["frequency"], errors="coerce")
     df["utilization"] = pd.to_numeric(df["utilization"], errors="coerce")
     df["repetition"] = pd.to_numeric(df["repetition"], errors="coerce")
@@ -41,8 +43,33 @@ def load_runs(csv_path: Union[str, Path]) -> pd.DataFrame:
     return df
 
 
+def filter_df(
+        df: pd.DataFrame,
+        experiment_id: str | None,
+        model_type: str | None,
+        freq: float | None,
+        util: float | None,
+    ) -> pd.DataFrame:
+    out = df.copy()
+    # experiment_id is optional (only if you log it)
+    if experiment_id is not None:
+        if "experiment_id" not in out.columns:
+            raise ValueError("experiment_id filtering requested but column 'experiment_id' not present in CSV.")
+        out = out[out["experiment_id"].astype(str) == str(experiment_id)]
+    if model_type is not None:
+        out = out[out["model_type"].astype(str) == str(model_type)]
+    if freq is not None:
+        out = out[np.isclose(out["frequency"].astype(float), float(freq))]
+    if util is not None:
+        out = out[np.isclose(out["utilization"].astype(float), float(util))]
+    return out
+
+
 def aggregate_metrics(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
-    """Aggregate metric columns into a long-form table with mean, std, best, and count."""
+    """
+    Returns long-form aggregated table with columns:
+      group_cols + metric + mean + std + best + n
+    """
     metric_cols = [c for c in df.columns if c not in META_COLS]
     if not metric_cols:
         raise ValueError("No metric columns found in CSV.")
@@ -55,14 +82,39 @@ def aggregate_metrics(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
         rows.append(agg)
 
     res = pd.concat(rows, ignore_index=True)
-    # Keep output ordering stable for plots and saved CSVs.
+    # Consistent ordering
     sort_cols = group_cols + ["metric"]
     res = res.sort_values(sort_cols).reset_index(drop=True)
     return res
 
+# def aggregate_like_experiment_py(df: pd.DataFrame) -> pd.DataFrame:
+#     """
+#     Reproduces the logic from experiment.py:
+#     repetition → mean per (model, freq, util)
+#     then
+#     frequency → mean per (model, util)
+#     """
+#     # 1) Average over repetitions
+#     per_freq = (
+#         df.groupby(["model_type", "frequency", "utilization"], as_index=False)
+#           .agg({m: "mean" for m in METRICS})
+#     )
+#     # 2) Average over frequencies
+#     per_util = (
+#         per_freq.groupby(["model_type", "utilization"], as_index=False)
+#                 .agg({m: "mean" for m in METRICS})
+#     )
+#     return per_util
+
 
 def pivot_metric(agg_long: pd.DataFrame, metric: str, value_col: str = "mean") -> pd.DataFrame:
-    """Pivot one metric from the long-form table into a frequency-by-utilization matrix."""
+    """
+    Convert long-form agg into a pivoted matrix:
+      index: frequency
+      columns: utilization
+      values: e.g. mean
+    Only works if agg_long includes frequency+utilization in its grouping.
+    """
     sub = agg_long[agg_long["metric"] == metric].copy()
     if not {"frequency", "utilization"} <= set(sub.columns):
         raise ValueError("pivot_metric requires grouping that includes 'frequency' and 'utilization'.")

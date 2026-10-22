@@ -1,8 +1,10 @@
-# training/experiment.py
+# code/training/experiment.py
 
 # Self imports
+from models.gnn import CircuitDataset
 from models.factory import get_shape, model_selector, create_model
-from training.state import RunState
+from data.loaders import data_preparation
+from training.state import RunState, EvalStats
 from training.recorder import record_repetition
 from training.metrics import get_scaler, get_optimizer, get_regression_loss, get_regression_metrics, normalized_mae
 from training.trainer import save_trained_model, compute_test_metrics_dict
@@ -18,7 +20,9 @@ import numpy as np
 import pandas as pd
 from quantiphy import Quantity
 from tqdm import tqdm
+from sklearn.metrics import mean_absolute_percentage_error
 from sklearn.metrics import mean_absolute_error
+
 from sklearn.model_selection import train_test_split
 from keras.models import load_model
 from keras.utils import plot_model
@@ -44,10 +48,35 @@ def train_once(model_type, model_parameters, prefix_string, repeat_string, x_tra
     model = create_model(model_type, model_parameters, config, f"{prefix_string}{repeat_string}")
     # Compile
     model.compile(optimizer=opt, loss=loss, metrics=mets)
+    # X_tr, X_val, Y_tr, Y_val = train_test_split(X_tr, Y_tr, test_size=0.2, shuffle=True, random_state=42)
+    # validation_data=(X_val, Y_val)
+
+    # # Fit
+    # history = model.fit(x_train, y_train, validation_split=0.2, shuffle=True, epochs=config.ep_count, batch_size=config.batch_size, verbose=0, callbacks=callbacks)
+    # ------------------------------------------------------------
+    # Explicit train / validation split (safe for multi-input)
+    # ------------------------------------------------------------
+    # val_frac = 0.2
+    # n = y_train.shape[0]
+    # n_val = int(val_frac * n)
+    # # Split y
+    # y_tr = y_train[:-n_val]
+    # y_val = y_train[-n_val:]
+    # # Split x (works for both list-input and single-input models)
+    # if isinstance(x_train, list):
+    #     x_tr = [arr[:-n_val] for arr in x_train]
+    #     x_val = [arr[-n_val:] for arr in x_train]
+    # else:
+    #     x_tr = x_train[:-n_val]
+    #     x_val = x_train[-n_val:]
     x_tr = x_train
     y_tr = y_train
+    fit_start_time = time.time()
     history = model.fit(x_tr, y_tr, validation_data=(x_val, y_val), shuffle=True, epochs=config.ep_count, batch_size=config.batch_size, verbose=0, callbacks=callbacks)
+    model._funtom_fit_time_sec = time.time() - fit_start_time
 
+    # model.load_weights('best.ckpt')
+    # tqdm.write(f"Available History keys for plot:\n{list(history.history.keys())}\n")
     # Plot training history
     history_plot(history, config.metrics_to_plot, paths.run_result_dir, saving_name)
     return model
@@ -60,12 +89,103 @@ def test_once(model, x_test, y_test, config):
     metrics_out = compute_test_metrics_dict(y_test, y_pred, config.metrics_names)
     return metrics_out, y_pred
 
-def train_phase(model_type, model_parameters, prefix_string, repeat_string, x_tr_k, y_tr_k, x_val, y_val, config, paths, saving_name, state: RunState):
+
+def _slice_model_inputs(x_data, start, stop):
+    if isinstance(x_data, (list, tuple)):
+        return [arr[start:stop] for arr in x_data]
+    return x_data[start:stop]
+
+
+def _input_row_count(x_data):
+    if isinstance(x_data, (list, tuple)):
+        if not x_data:
+            return 0
+        return int(len(x_data[0]))
+    return int(len(x_data))
+
+
+def measure_prediction_latency(model, x_data, config, *, source):
+    """Measure model.predict latency on one sample and one configured batch."""
+    rows = []
+    n_rows = _input_row_count(x_data)
+    if n_rows <= 0:
+        return rows
+
+    warmup = max(0, int(getattr(config, "inference_latency_warmup", 2)))
+    repeats = max(1, int(getattr(config, "inference_latency_repeats", 10)))
+    batch_size = max(1, min(int(getattr(config, "inference_latency_batch_size", 512)), n_rows))
+
+    for label, sample_count in [("single", 1), ("batch", batch_size)]:
+        x_latency = _slice_model_inputs(x_data, 0, sample_count)
+        for _ in range(warmup):
+            model.predict(x_latency, verbose=0)
+
+        durations = []
+        for _ in range(repeats):
+            start = time.perf_counter()
+            model.predict(x_latency, verbose=0)
+            durations.append(time.perf_counter() - start)
+
+        arr = np.asarray(durations, dtype=float)
+        rows.append({
+            "source": source,
+            "mode": label,
+            "samples": sample_count,
+            "warmup": warmup,
+            "repeats": repeats,
+            "mean_latency_ms": float(np.mean(arr) * 1000.0),
+            "median_latency_ms": float(np.median(arr) * 1000.0),
+            "min_latency_ms": float(np.min(arr) * 1000.0),
+            "max_latency_ms": float(np.max(arr) * 1000.0),
+            "std_latency_ms": float(np.std(arr) * 1000.0),
+            "mean_per_sample_ms": float((np.mean(arr) / sample_count) * 1000.0),
+        })
+    return rows
+
+def build_weight_metadata(experiment_id, model_type, freq, util, repetition, config, paths, coord, input_shape_str=None, output_shape=None, nodes_phrase=None):
+    return {
+        "experiment_id": experiment_id,
+        "architecture": config.main_arch,
+        "topology": config.main_topology,
+        "coordinate": coord,
+        "dataset_version": config.dataset_version,
+        "dataset_variant": config.dataset_variant,
+        "train_dataset_split": config.dataset_split,
+        "heldout_eval_enabled": bool(config.run_heldout_eval),
+        "heldout_dataset_split": config.heldout_dataset_split if config.run_heldout_eval else None,
+        "dataset_root": paths.dataset_root,
+        "target": "_".join(config.targets),
+        "frequency_hz": float(freq),
+        "frequency_ghz": float(freq / 1e9),
+        "utilization": float(util),
+        "repetition": int(repetition),
+        "seed": int(config.base_seed + repetition),
+        "model_type": model_type,
+        "input_shape": input_shape_str,
+        "output_shape": str(output_shape) if output_shape is not None else None,
+        "layers": nodes_phrase,
+        "optimizer": config.optimizer_name,
+        "learning_rate": config.learning_rate,
+        "batch_size": config.batch_size,
+        "validation_ratio": config.val_ratio,
+        "scaler": config.scaler_name,
+        "loss_function": config.loss_name,
+        "metrics": "_".join(config.metrics_names),
+        "weight_directory": paths.weights_path,
+    }
+
+
+def train_phase(model_type, model_parameters, prefix_string, repeat_string, x_tr_k, y_tr_k, x_val, y_val, config, paths, saving_name, state: RunState, weight_metadata=None):
     model_saved = False
     model_trained = train_once(model_type, model_parameters, prefix_string, repeat_string, x_tr_k, y_tr_k, x_val, y_val, config, paths, saving_name)
     if not state.model_printed:
         # Plot model architecture ("TB": vertical plot; "LR": horizontal plot)
-        plot_model(model_trained, to_file=os.path.join(paths.run_result_dir, f"Model_{model_type}_{config.main_arch}.png"), show_shapes=True, show_dtype=True, show_layer_names=True, rankdir="TB", show_layer_activations=True)
+        try:
+            plot_model(model_trained, to_file=os.path.join(paths.run_result_dir, f"Model_{model_type}_{config.main_arch}.png"), show_shapes=True, show_dtype=True, show_layer_names=True, rankdir="TB", show_layer_activations=True)
+        except Exception as exc:
+            warning = f"Model architecture plot skipped for {model_type}: {type(exc).__name__}: {exc}"
+            tqdm.write(warning)
+            append_text_to_file(warning, paths.result_log_file)
         # Print the model summary
         stringlist = []
         model_trained.summary(print_fn=lambda x: stringlist.append(x))
@@ -75,7 +195,7 @@ def train_phase(model_type, model_parameters, prefix_string, repeat_string, x_tr
         state.model_printed = True
     if config.save_model and (not os.path.exists(os.path.join(paths.weights_path, f"{saving_name}.keras"))):
         # If the model is not already saved, save it
-        save_log = save_trained_model(model_trained, paths.weights_path, model_name=saving_name)
+        save_log = save_trained_model(model_trained, paths.weights_path, model_name=saving_name, metadata=weight_metadata)
         tqdm.write(save_log)
         model_saved = True
     return model_trained, model_saved
@@ -85,12 +205,17 @@ def test_phase(x_test, y_test, config, paths, saving_name, model_trained, util, 
     if config.train_model:
         model_to_test = model_trained
     else:
+        # Load model if training was skipped
+        # # old version
+        # load_path = os.path.join(model_saving_path, f"{model_name_base}.h5")
+        # model_to_test = legacy_h5_format.load_model_from_hdf5(load_path, custom_objects={'mae': 'mae'}, compile = False)
+        # New version:
         load_path = os.path.join(paths.weights_path, f"{saving_name}.keras")
         model_to_test = load_model(load_path)
     metrics_out, y_pred = test_once(model_to_test, x_test, y_test, config)
     metrics_string = ", ".join([f"{m.upper()}: {metrics_out[m]:.4f}" for m in config.metrics_names])
     tqdm.write(f"Test on {Quantity(f'{freq} Hz')} & {util*100} %: {metrics_string}\n")
-    return metrics_out, y_pred
+    return metrics_out, y_pred, model_to_test
 
 
 def build_model_names(model_type, freq, util, r, config, model_parameters, nodes_phrase, coordinate_string):
@@ -116,8 +241,8 @@ def build_model_names(model_type, freq, util, r, config, model_parameters, nodes
         if isinstance(mp, dict) and "io" in mp and "outputs" in mp["io"]:
             return mp["io"]["outputs"]
         return mp.get("output_params")
-    if model_type in ["CCIGNN", "CCIGNN-Con", "CCIGNN-Sep", "CCIGNN-SepCon"]:
-        # Hybrid shapes: [cci groups] + graph tensors (X, A)
+    if model_type in ["CCIGNN", "CCIGNN-Con", "CCIGNN-Sep", "CCIGNN-SepCon", "CCIEdgeGNN-Sep", "CCIEdgeGNN-Sep-v2", "CCIEdgeGNN-Sep-v3"]:
+        # Hybrid shapes: [CCI groups] + graph tensors (X, A[, E]).
         io = model_parameters.get("io", {})
         cci_groups = io.get("cci_input_groups", [])   # should be the cci groups
         late_features = io.get("late_features", [])
@@ -130,9 +255,12 @@ def build_model_names(model_type, freq, util, r, config, model_parameters, nodes
             "X": (N, F),
             "A": (N, N),
         }
+        if model_type in ("CCIEdgeGNN-Sep", "CCIEdgeGNN-Sep-v2", "CCIEdgeGNN-Sep-v3"):
+            input_shape["E"] = (N, N, model_parameters["E"])
         late_part = f"_late-{input_shape['late']}" if input_shape["late"] > 0 else ""
         # Filesystem-safe string version (for filenames)
-        input_shape_str = (f"cci-{'+'.join(map(str, input_shape['cci']))}{late_part}_X-{N}x{F}_A-{N}x{N}")
+        edge_part = f"_E-{N}x{N}x{input_shape['E'][2]}" if "E" in input_shape else ""
+        input_shape_str = (f"cci-{'+'.join(map(str, input_shape['cci']))}{late_part}_X-{N}x{F}_A-{N}x{N}{edge_part}")
     else:
         inp = _io_inputs(model_parameters)
         input_shape = get_shape(inp)
@@ -188,7 +316,7 @@ def record_prediction_samples(
     df.to_csv(path, mode="a", header=write_header, index=False)
 
 
-def run_utilization_block(experiment_id, freq, util, model_parameters, nodes_phrase, x_train, y_train, x_test, y_test, model_type, config, paths, pbar, train_time_weight, test_time_weight, coordinate_string, coord, user, yscaler, state: RunState):
+def run_utilization_block(experiment_id, freq, util, model_parameters, nodes_phrase, x_train, y_train, x_test, y_test, model_type, config, paths, pbar, train_time_weight, test_time_weight, coordinate_string, coord, user, yscaler, state: RunState, x_heldout=None, y_heldout=None):
     # tqdm.write(str(f"{np.shape(x_train)}, {np.shape(x_test)}"))
     for r in range(config.repetition):
         set_global_seed(config.base_seed + r)
@@ -205,28 +333,38 @@ def run_utilization_block(experiment_id, freq, util, model_parameters, nodes_phr
         y_val = y_train[val_idx]
 
         k = max(1, int(util * len(y_train_pool)))   # how many samples
-        if model_type in ["CCI", "CCI-Top", "CCI-TopNet", "CCI-TopNetCon", "CCI-Sep", "CCI-SepTopNet"]:
-            # It's similar to below, but for CCI-NN we have two circuit components
-            # Handle arbitrary number of CCI inputs (base groups + optional topology group)
-            x_tr_k = [arr[:k] for arr in x_train_pool]
-        elif model_type in ["GNN",  "GNN-ATT", "CCIGNN", "CCIGNN-Con", "CCIGNN-Sep", "CCIGNN-SepCon"]:
-            # It's similar to above, but for GNN we have two inputs: X and A
-            # x_tr_k = [x_train[0][:k], x_train[1][:k]]
+        if isinstance(x_train_pool, list):
+            # Multi-input models (CCI, node GNN, edge GNN, and hybrids).
             x_tr_k = [arr[:k] for arr in x_train_pool]
         else:
             x_tr_k = x_train_pool[:k]
         y_tr_k = y_train_pool[:k]
         loop_start_time = time.time()
         prefix_string, repeat_string, saving_name, input_shape_str, output_shape = build_model_names(model_type, freq, util, r, config, model_parameters, nodes_phrase, coordinate_string)
+        weight_metadata = build_weight_metadata(
+            experiment_id,
+            model_type,
+            freq,
+            util,
+            r,
+            config,
+            paths,
+            coord,
+            input_shape_str=input_shape_str,
+            output_shape=output_shape,
+            nodes_phrase=nodes_phrase,
+        )
         model_saved = False
         model_trained = None
         # Training Phase
+        training_time_sec = None
         if config.train_model:
-            model_trained, model_saved = train_phase(model_type, model_parameters, prefix_string, repeat_string, x_tr_k, y_tr_k, x_val, y_val, config, paths, saving_name, state)
+            model_trained, model_saved = train_phase(model_type, model_parameters, prefix_string, repeat_string, x_tr_k, y_tr_k, x_val, y_val, config, paths, saving_name, state, weight_metadata=weight_metadata)
+            training_time_sec = getattr(model_trained, "_funtom_fit_time_sec", None)
         pbar.update(train_time_weight if config.train_model else 0)
         # Testing Phase:
         if config.test_model:
-            metrics_out, y_pred = test_phase(x_test, y_test, config, paths, saving_name, model_trained, util, freq)
+            metrics_out, y_pred, model_to_test = test_phase(x_test, y_test, config, paths, saving_name, model_trained, util, freq)
             raw_record = {
                 # identity
                 "timestamp": time.time(),
@@ -242,6 +380,8 @@ def run_utilization_block(experiment_id, freq, util, model_parameters, nodes_phr
                 "utilization": util,
                 "repetition": r,
                 "seed": config.base_seed + r,
+                "training_time_sec": training_time_sec,
+                "model_param_count": model_to_test.count_params(),
                 # model config
                 "optimizer": config.optimizer_name,
                 "learning_rate": config.learning_rate,
@@ -254,6 +394,25 @@ def run_utilization_block(experiment_id, freq, util, model_parameters, nodes_phr
             # Add computed metrics like "mae": metrics_out["mae"],
             raw_record.update(metrics_out)
             record_repetition(raw_record, path=os.path.join(paths.run_result_dir, "all_repetitions.csv"))
+
+            if getattr(config, "measure_inference_latency", False):
+                for latency_record in measure_prediction_latency(model_to_test, x_test, config, source="test"):
+                    latency_record.update({
+                        "timestamp": time.time(),
+                        "experiment_id": experiment_id,
+                        "schema_version": "inference_latency_v1",
+                        "user": user,
+                        "model_type": model_type,
+                        "architecture": config.main_arch,
+                        "topology": config.main_topology,
+                        "coordinate": coord,
+                        "frequency": freq,
+                        "utilization": util,
+                        "repetition": r,
+                        "seed": config.base_seed + r,
+                    })
+                    data_to_csv_saver(os.path.join(paths.run_result_dir, "inference_latency.csv"), latency_record)
+
             y_true_to_save = y_test
             y_pred_to_save = y_pred
 
@@ -282,8 +441,77 @@ def run_utilization_block(experiment_id, freq, util, model_parameters, nodes_phr
                 if config.write_to_csv:
                     path = save_preds_per_frequency(results_dir=paths.run_result_dir, model_type=model_type, freq_label=str(freq / 1e9), y_pred=y_pred, yscaler=yscaler, spec_name=config.targets[0], overwrite=True)
                     tqdm.write(f"Prediction file saved: {path}")
+            if config.run_heldout_eval and x_heldout is not None and y_heldout is not None:
+                heldout_metrics, heldout_pred = test_once(model_to_test, x_heldout, y_heldout, config)
+                heldout_metrics_string = ", ".join([f"{m.upper()}: {heldout_metrics[m]:.4f}" for m in config.metrics_names])
+                tqdm.write(f"Heldout on {Quantity(f'{freq} Hz')} & {util*100} %: {heldout_metrics_string}\n")
+                if getattr(config, "measure_inference_latency", False):
+                    for latency_record in measure_prediction_latency(model_to_test, x_heldout, config, source="heldout"):
+                        latency_record.update({
+                            "timestamp": time.time(),
+                            "experiment_id": experiment_id,
+                            "schema_version": "inference_latency_v1",
+                            "user": user,
+                            "model_type": model_type,
+                            "architecture": config.main_arch,
+                            "topology": config.main_topology,
+                            "coordinate": coord,
+                            "frequency": freq,
+                            "utilization": util,
+                            "repetition": r,
+                            "seed": config.base_seed + r,
+                        })
+                        data_to_csv_saver(os.path.join(paths.run_result_dir, "inference_latency.csv"), latency_record)
+                heldout_record = {
+                    "timestamp": time.time(),
+                    "experiment_id": experiment_id,
+                    "schema_version": "heldout_v1",
+                    "user": user,
+                    "model_type": model_type,
+                    "architecture": config.main_arch,
+                    "topology": config.main_topology,
+                    "coordinate": coord,
+                    "dataset_version": config.dataset_version,
+                    "dataset_variant": config.dataset_variant,
+                    "train_dataset_split": config.dataset_split,
+                    "heldout_dataset_split": config.heldout_dataset_split,
+                    "frequency": freq,
+                    "utilization": util,
+                    "repetition": r,
+                    "seed": config.base_seed + r,
+                    "optimizer": config.optimizer_name,
+                    "learning_rate": config.learning_rate,
+                    "batch_size": config.batch_size,
+                    "scaler": config.scaler_name,
+                    "loss_function": config.loss_name,
+                    "metrics": "_".join(config.metrics_names),
+                }
+                heldout_record.update(heldout_metrics)
+                data_to_csv_saver(os.path.join(paths.run_result_dir, "heldout_results.csv"), heldout_record)
+
+                if yscaler is not None:
+                    y_heldout_to_save = yscaler.inverse_transform(np.asarray(y_heldout).reshape(-1, 1)).reshape(-1)
+                    y_heldout_pred_to_save = yscaler.inverse_transform(np.asarray(heldout_pred).reshape(-1, 1)).reshape(-1)
+                else:
+                    y_heldout_to_save = np.asarray(y_heldout).reshape(-1)
+                    y_heldout_pred_to_save = np.asarray(heldout_pred).reshape(-1)
+                record_prediction_samples(
+                    path=os.path.join(paths.run_result_dir, "all_heldout_predictions.csv"),
+                    experiment_id=experiment_id,
+                    user=user,
+                    model_type=model_type,
+                    architecture=config.main_arch,
+                    topology=config.main_topology,
+                    coordinate=coord,
+                    frequency=freq,
+                    utilization=util,
+                    repetition=r,
+                    seed=config.base_seed + r,
+                    y_true=y_heldout_to_save,
+                    y_pred=y_heldout_pred_to_save,
+            )
             def _save_new_model():
-                save_log = save_trained_model(model_trained, paths.weights_path, model_name=saving_name)
+                save_log = save_trained_model(model_trained, paths.weights_path, model_name=saving_name, metadata=weight_metadata)
                 tqdm.write(save_log)
             # Save the model after testing if not saved before:
             if config.save_model and config.train_model and (not model_saved):
@@ -319,6 +547,8 @@ def run_utilization_block(experiment_id, freq, util, model_parameters, nodes_phr
                 'model_type': model_type, 'input_shape': input_shape_str, 'output_shape': output_shape, 'layers': nodes_phrase,
                 'optimizer': config.optimizer_name, 'learning_rate': config.learning_rate, 'scaler': config.scaler_name, 'loss_function': config.loss_name, 'metrics': '_'.join(config.metrics_names),
                 'frequency': freq, 'utilization': util, 'batch_size': config.batch_size, 'validation_ratio': config.val_ratio, 'loop_time_sec': round(loop_time, 2),
+                'training_time_sec': round(training_time_sec, 2) if training_time_sec is not None else None,
+                'model_param_count': model_to_test.count_params(),
             }
             results_to_save.update(metrics_out)
             data_to_csv_saver(os.path.join(paths.run_result_dir, f"run_results.csv"), results_to_save)
@@ -343,11 +573,12 @@ def run_frequency_block(
         coordinate_string,
         coord,
         user,
-        state: RunState
+        state: RunState,
+        data_by_freq_heldout=None,
     ):
     # Data preparation via adapters (model-agnostic)
     adapter = get_data_adapter(model_type, config, use_topology_features=use_topology_features)
-    # Make sure topology one-hot features do not leak into models that should not see them.
+    # STEP 4: Sanity check – no topology leakage
     if model_type.endswith("-noTop"):
         io = model_parameters.get("io", {})
         if "inputs" in io:
@@ -369,12 +600,26 @@ def run_frequency_block(
     x_test  = adapter_out.x_test
     y_test  = adapter_out.y_test
     yscaler = adapter_out.yscaler
+    x_heldout = None
+    y_heldout = None
+    if config.run_heldout_eval and data_by_freq_heldout is not None and freq in data_by_freq_heldout:
+        heldout_df = data_by_freq_heldout[freq]
+        if heldout_df is not None and not heldout_df.empty:
+            heldout_adapter_out = adapter.prepare(
+                df_train=data_by_freq_tr[freq],
+                df_test=heldout_df,
+                config=config,
+                model_parameters=model_parameters,
+                scaler=scaler,
+            )
+            x_heldout = heldout_adapter_out.x_test
+            y_heldout = heldout_adapter_out.y_test
     
     if config.debug:
         io = model_parameters.get("io", {})
-        if model_type in ("FCN", "FCN-Top", "FCN-SepTopNet"):
+        if model_type in ("FCN", "redFCN", "FCN-Top", "FCN-SepTopNet"):
             assert isinstance(x_train, np.ndarray), f"[{model_type}] expected dense ndarray input"
-        elif model_type in ("CCI", "CCI-Top", "CCI-TopNet", "CCI-TopNetCon", "CCI-Sep"):
+        elif model_type in ("CCI", "redCCI", "CCI-Top", "CCI-TopNet", "CCI-TopNetCon", "CCI-Sep"):
             expected_groups = None
             expected_late = 0
             if "input_groups" in io:
@@ -394,10 +639,13 @@ def run_frequency_block(
             assert isinstance(x_train, list), f"[{model_type}] expected list input"
             expected_total = expected_groups + expected_topology + expected_late
             assert len(x_train) == expected_total, (f"[{model_type}] got {len(x_train)} inputs, expected {expected_total} ({expected_groups} groups + {expected_topology} topology + {expected_late} late)")
-        elif model_type in ("GNN", "GNN-ATT"):
+        elif model_type in ("GNN", "GNN-Large", "GNN-ATT"):
             assert isinstance(x_train, list), f"[{model_type}] expected graph input list"
             assert len(x_train) == 2, f"[{model_type}] expected [X, A]"
-        elif model_type in ["CCIGNN", "CCIGNN-Con", "CCIGNN-Sep", "CCIGNN-SepCon"]:
+        elif model_type in ("EdgeGNN", "EdgeGNN-Large"):
+            assert isinstance(x_train, list), f"[{model_type}] expected graph input list"
+            assert len(x_train) == 3, f"[{model_type}] expected [X, A, E]"
+        elif model_type in ["CCIGNN", "CCIGNN-Con", "CCIGNN-Sep", "CCIGNN-SepCon", "CCIEdgeGNN-Sep", "CCIEdgeGNN-Sep-v2", "CCIEdgeGNN-Sep-v3"]:
             expected_cci_groups = None
             expected_late = 0
             if "cci_input_groups" in io:
@@ -407,8 +655,10 @@ def run_frequency_block(
                 expected_cci_groups = len(model_parameters["cci_input_groups"])
             assert isinstance(x_train, list), "[CCI-GNN] expected hybrid input list"
             assert expected_cci_groups is not None, "[CCI-GNN] could not infer expected CCI groups"
-            expected_total = expected_cci_groups + expected_late + 2
-            assert len(x_train) == expected_total, (f"[CCI-GNN] expected {expected_total} inputs ([{expected_cci_groups} CCI groups] + {expected_late} late + X + A), got {len(x_train)}")
+            graph_input_count = 3 if model_type in ("CCIEdgeGNN-Sep", "CCIEdgeGNN-Sep-v2", "CCIEdgeGNN-Sep-v3") else 2
+            expected_total = expected_cci_groups + expected_late + graph_input_count
+            graph_inputs = "X + A + E" if graph_input_count == 3 else "X + A"
+            assert len(x_train) == expected_total, (f"[CCI-GNN] expected {expected_total} inputs ([{expected_cci_groups} CCI groups] + {expected_late} late + {graph_inputs}), got {len(x_train)}")
 
     for util in config.utilization:
         run_utilization_block(
@@ -431,10 +681,12 @@ def run_frequency_block(
             coord=coord,
             user=user,
             yscaler=yscaler,
-            state=state
+            state=state,
+            x_heldout=x_heldout,
+            y_heldout=y_heldout,
         )
 
-def run_experiments(experiment_id, config, paths, data_by_freq_tr, data_by_freq_te, coord, coordinate_string, user):
+def run_experiments(experiment_id, config, paths, data_by_freq_tr, data_by_freq_te, coord, coordinate_string, user, data_by_freq_heldout=None):
     total_time = time.time()
     for model_type in config.model_types:
         # Model-local feature policy
@@ -480,7 +732,8 @@ def run_experiments(experiment_id, config, paths, data_by_freq_tr, data_by_freq_
                     coordinate_string=coordinate_string,
                     coord=coord,
                     user=user,
-                    state=state
+                    state=state,
+                    data_by_freq_heldout=data_by_freq_heldout,
                 )
         model_time = time.time() - program_starts
         print(f"{model_type} model experiment completed in {Quantity(model_time)}.\n\n")

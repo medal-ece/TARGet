@@ -24,3 +24,25 @@ keywords:
   - GNN
   - RF
   - machine learning
+
+url: "https://github.com/medal-ece/TARGet"
+preferred-citation:
+  type: article
+  title: "TARGet: Topology-Aware Fusion-based Radio Frequency Circuit Functional Modeling using Graph Neural Networks"
+  authors:
+    - given-names: Soroosh
+      family-names: Noorzad
+      email: soroosh.noorzad@utah.edu
+      affiliation: "University of Utah, Salt Lake City, Utah, USA"
+    - given-names: Sebastian
+      family-names: Bodero
+      email: sebastian.bodero@utah.edu
+      affiliation: "University of Utah, Salt Lake City, Utah, USA"
+    - given-names: Morteza
+      family-names: Fayazi
+      email: m.fayazi@utah.edu
+      affiliation: "University of Utah, Salt Lake City, Utah, USA"
+  journal: "arXiv"
+  year: 2026
+  doi: "10.48550/arXiv.2609.22165"
+  url: "https://arxiv.org/abs/2609.22165"

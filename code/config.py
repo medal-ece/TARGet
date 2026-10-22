@@ -29,6 +29,22 @@ class Config:
     manual_freqs: list = field(default_factory=list)  # List of specific frequencies for manual mode
     freq_list: list = field(default_factory=lambda: [9800000000])
 
+    workflow: str = "main"
+    measure_inference_latency: bool = True
+    inference_latency_warmup: int = 2
+    inference_latency_repeats: int = 10
+    inference_latency_batch_size: int = 512
+    dataset_version: str = "v1"
+    dataset_variant: str | None = None
+    dataset_split: str = "main"
+    heldout_dataset_split: str = "heldout"
+    run_heldout_eval: bool = False
+    lna_heldout_in_match_topologies: list = field(default_factory=lambda: ["inf_cap_ind"])
+    lna_heldout_out_match_topologies: list = field(default_factory=lambda: ["inf_cap_ind"])
+    lna_heldout_match_rule: str = "either_side"
+    use_dataset_cache: bool = True
+    rebuild_dataset_cache: bool = False
+
     # Shared model and optimizer settings.
     main_arch: str = "LNA" # LNA, phase_shifter
     TOPOLOGY_COL = "topology_index"

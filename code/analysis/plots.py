@@ -1,5 +1,4 @@
-# code/analysis/plots.py
-"""Plot builders for experiment summaries and prediction analysis."""
+# analysis/plots.py
 import math
 import colorsys
 import numpy as np
@@ -11,9 +10,9 @@ from prettytable import PrettyTable
 
 from analysis.core import load_runs, aggregate_metrics
 
-def color_variants(base_color, lightness_factors=[1.5, 1.0, 0.7]):
+def color_variants(base_color, lightness_factors=[1.0, 1.35, 0.7]):
     """
-    Build a few lighter and darker variations of one base color.
+    Generate visually close colors from a base color.
     base_color : str or RGB
         Matplotlib color (e.g. 'tab:blue')
     lightness_factors : list[float]
@@ -28,7 +27,10 @@ def color_variants(base_color, lightness_factors=[1.5, 1.0, 0.7]):
     return colors
 
 def auto_subplot_grid(n_plots, max_cols=3):
-    """Return a compact subplot grid for the requested number of panels."""
+    """
+    Compute a near-square (nrows, ncols) layout for n_plots,
+    preferring compact grids and avoiding empty columns.
+    """
     ncols = min(max_cols, math.ceil(math.sqrt(n_plots)))
     nrows = math.ceil(n_plots / ncols)
     return nrows, ncols
@@ -40,7 +42,11 @@ def plot_utilization_curves_per_freq(
     title_suffix: str = "",
     MODEL_BASE_COLORS=None,
 ):
-    """Plot mean and best metric curves versus utilization for each frequency."""
+    """
+    For each frequency and metric:
+      plot metric vs utilization
+      with mean and best curves per model_type.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     required = {"model_type", "frequency", "utilization", "metric", "mean", "best"}
@@ -71,6 +77,56 @@ def plot_utilization_curves_per_freq(
             out_path = out_dir / f"{str(freq / 1e9)} GHz_{metric.upper()}.png"
             plt.savefig(out_path, dpi=200)
             plt.close()
+
+
+# def plot_utilization_curves_total(
+#     agg_long: pd.DataFrame,
+#     out_dir: Path,
+#     title_suffix: str = "",
+#     MODEL_BASE_COLORS=None,
+# ):
+#     """
+#     Aggregate metrics over frequency, then plot vs utilization.
+#     """
+#     out_dir.mkdir(parents=True, exist_ok=True)
+#     required = {"model_type", "frequency", "utilization", "metric", "mean", "best"}
+#     if not required <= set(agg_long.columns):
+#         raise ValueError(f"Missing required columns: {required - set(agg_long.columns)}")
+#     # ---- average over frequency ----
+#     avg = (
+#         agg_long
+#         .groupby(["model_type", "utilization", "metric"], as_index=False)
+#         .agg(
+#             mean_over_freq=("mean", "mean"),
+#             # Creates a new column called "best_over_freq" by applying
+#             # the aggregation function "mean" to the column "best", within each group.
+#             best_over_freq_avg=("best", "mean"),
+#             best_over_freq_best=("best", "min"),
+#         )
+#     )
+#     n_rep = int(agg_long["n"].iloc[0])
+#     # ---- plotting ----
+#     for metric in sorted(avg["metric"].unique()):
+#         plt.figure(figsize=(8, 4))
+#         sub = avg[avg["metric"] == metric]
+#         for model in sorted(sub["model_type"].unique()):
+#             mean_c, avg_best_c, best_best_c = color_variants(MODEL_BASE_COLORS[model])
+#             d = sub[sub["model_type"] == model].sort_values("utilization")
+#             x = d["utilization"] * 100
+#             plt.plot(x, d["mean_over_freq"], marker="o", linestyle="-", color=mean_c, alpha=1.0, label=f"{model} (mean)")
+#             plt.plot(x, d["best_over_freq_avg"], marker="x", linestyle="--", color=avg_best_c, alpha=0.6, label=f"{model} (Average of best)")
+#             plt.plot(x, d["best_over_freq_best"], marker="*", linestyle="-.", color=best_best_c, alpha=0.3, label=f"{model} (Best of best)")
+#         plt.xlabel("Utilization (%)")
+#         plt.ylabel(metric.upper())
+#         plt.title(f"{metric.upper()} vs Utilization (avg over freq) (n_rep={n_rep}) {title_suffix}".strip())
+#         plt.grid(True, alpha=0.3)
+#         plt.legend(fontsize=9)
+#         plt.tight_layout()
+#         out_path = out_dir / f"{metric}_util_avg_over_freq.png"
+#         plt.savefig(out_path, dpi=200)
+#         plt.close()
+#     avg.to_csv(out_dir / "aggregated_metrics_avg_over_freq.csv", index=False)
+
 
 def plot_all_metrics_per_freq(agg_long: pd.DataFrame, out_dir: Path, title_suffix: str = "", MODEL_BASE_COLORS=None, coord_system: str = "Unknown"):
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -180,7 +236,8 @@ def plot_utilization_curves_total(agg_long: pd.DataFrame, out_dir: Path, title_s
 
 def plot_all_metrics_per_util(agg_long: pd.DataFrame, out_dir: Path, util: float = 1.0, title_suffix: str = "", MODEL_BASE_COLORS=None, coord_system: str = "Unknown", prefix: str = "errbyfreq",):
     """
-    Plot all metrics against frequency for one utilization level.
+    Plot ALL metrics vs frequency at a fixed utilization (e.g. 100%).
+    One figure per utilization.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     required = {"model_type", "frequency", "utilization", "metric", "mean", "best", "n"}
@@ -533,6 +590,211 @@ def build_appendix_frequency_table(runs_csv_path: Path, pred_csv_path: Path, out
     table.title = f"APPENDIX TABLE (first {print_rows} rows)"
     print("\n", table, "\n")
     return final_df
+
+
+def _mean_metrics_for_mode(csv_path: Path, mode: str, experiment_id: str | None = None, util: float = 1.0):
+    df = load_runs(csv_path)
+    if experiment_id is not None and "experiment_id" in df.columns:
+        df = df[df["experiment_id"].astype(str) == str(experiment_id)]
+    df = df[np.isclose(df["utilization"].astype(float), float(util))]
+    if df.empty:
+        raise ValueError(f"No data for mode={mode}, utilization={util}: {csv_path}")
+    metrics = [c for c in ["mae", "mape", "rmse", "nmae"] if c in df.columns]
+    by_freq = (
+        df.groupby(["model_type", "frequency"], as_index=False)
+        .agg({metric: "mean" for metric in metrics})
+    )
+    by_freq["mode"] = mode
+    return by_freq, metrics
+
+
+def build_heldout_comparison_tables(
+    normal_csv_path: Path,
+    heldout_csv_path: Path,
+    out_dir: Path,
+    experiment_id: str | None = None,
+    util: float = 1.0,
+    prefix: str = "heldout_vs_normal",
+):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    normal, normal_metrics = _mean_metrics_for_mode(normal_csv_path, "normal", experiment_id=experiment_id, util=util)
+    heldout, heldout_metrics = _mean_metrics_for_mode(heldout_csv_path, "heldout", experiment_id=experiment_id, util=util)
+    metrics = [m for m in normal_metrics if m in heldout_metrics]
+    merged = normal.merge(heldout, on=["model_type", "frequency"], suffixes=("_normal", "_heldout"))
+    for metric in metrics:
+        merged[f"{metric}_gap"] = merged[f"{metric}_heldout"] - merged[f"{metric}_normal"]
+        merged[f"{metric}_ratio"] = np.where(
+            merged[f"{metric}_normal"] != 0,
+            merged[f"{metric}_heldout"] / merged[f"{metric}_normal"],
+            np.nan,
+        )
+    merged["frequency_ghz"] = merged["frequency"] / 1e9
+    merged.to_csv(out_dir / f"{prefix}_by_frequency_U{int(util*100)}.csv", index=False)
+
+    agg_spec = {}
+    for metric in metrics:
+        agg_spec[f"{metric}_normal"] = (f"{metric}_normal", "mean")
+        agg_spec[f"{metric}_heldout"] = (f"{metric}_heldout", "mean")
+        agg_spec[f"{metric}_gap"] = (f"{metric}_gap", "mean")
+        agg_spec[f"{metric}_ratio"] = (f"{metric}_ratio", "mean")
+    summary = (
+        merged.groupby("model_type", as_index=False)
+        .agg(**agg_spec)
+        .sort_values("nmae_heldout" if "nmae" in metrics else f"{metrics[0]}_heldout")
+    )
+    summary.to_csv(out_dir / f"{prefix}_summary_U{int(util*100)}.csv", index=False)
+
+    if "nmae" in metrics:
+        base_col = "nmae_heldout"
+    else:
+        base_col = f"{metrics[0]}_heldout"
+    best_model = summary.iloc[0]["model_type"]
+    improvement_rows = []
+    for metric in metrics:
+        best_target = float(summary.loc[summary["model_type"] == best_model, f"{metric}_heldout"].iloc[0])
+        baselines = summary[summary["model_type"] != best_model]
+        best_baseline = baselines.sort_values(f"{metric}_heldout").iloc[0] if not baselines.empty else None
+        if best_baseline is not None:
+            baseline_value = float(best_baseline[f"{metric}_heldout"])
+            improvement_rows.append({
+                "metric": metric,
+                "best_model": best_model,
+                "best_model_heldout": best_target,
+                "best_baseline": best_baseline["model_type"],
+                "best_baseline_heldout": baseline_value,
+                "relative_improvement_percent": 100.0 * (baseline_value - best_target) / baseline_value if baseline_value else np.nan,
+            })
+    improvement = pd.DataFrame(improvement_rows)
+    improvement.to_csv(out_dir / f"{prefix}_best_model_improvement_U{int(util*100)}.csv", index=False)
+    return merged, summary, improvement
+
+
+def plot_heldout_comparison(
+    normal_csv_path: Path,
+    heldout_csv_path: Path,
+    out_dir: Path,
+    experiment_id: str | None = None,
+    util: float = 1.0,
+    MODEL_BASE_COLORS=None,
+    plot_show: bool = False,
+    prefix: str = "heldout_vs_normal",
+):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    merged, summary, _ = build_heldout_comparison_tables(
+        normal_csv_path=normal_csv_path,
+        heldout_csv_path=heldout_csv_path,
+        out_dir=out_dir,
+        experiment_id=experiment_id,
+        util=util,
+        prefix=prefix,
+    )
+    metrics = [m[:-8] for m in summary.columns if m.endswith("_heldout") and f"{m[:-8]}_normal" in summary.columns]
+    model_order = list(summary["model_type"])
+
+    nrows, ncols = auto_subplot_grid(len(metrics), max_cols=2)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.2 * nrows))
+    axes = np.asarray(axes).reshape(-1) if len(metrics) > 1 else [axes]
+    x = np.arange(len(model_order))
+    width = 0.36
+    for ax, metric in zip(axes, metrics):
+        normal_vals = [float(summary.loc[summary["model_type"] == model, f"{metric}_normal"].iloc[0]) for model in model_order]
+        heldout_vals = [float(summary.loc[summary["model_type"] == model, f"{metric}_heldout"].iloc[0]) for model in model_order]
+        ax.bar(x - width / 2, normal_vals, width, label="Normal test", color="#4C78A8")
+        ax.bar(x + width / 2, heldout_vals, width, label="Heldout zero-shot", color="#F58518")
+        ax.set_title(metric.upper())
+        ax.set_xticks(x)
+        ax.set_xticklabels(model_order, rotation=25, ha="right")
+        ax.grid(True, axis="y", alpha=0.25)
+    for ax in axes[len(metrics):]:
+        ax.remove()
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False)
+    fig.suptitle(f"Normal vs Heldout Metrics | {int(util*100)}% Utilization", fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(out_dir / f"{prefix}_metric_bars_U{int(util*100)}.png", dpi=220)
+    if plot_show:
+        plt.show()
+    plt.close(fig)
+
+    if "nmae_gap" in merged.columns:
+        fig, ax = plt.subplots(figsize=(9.5, 5.6))
+        for model in sorted(merged["model_type"].unique()):
+            d = merged[merged["model_type"] == model].sort_values("frequency")
+            color = None
+            if MODEL_BASE_COLORS is not None and model in MODEL_BASE_COLORS:
+                color, _, _ = color_variants(MODEL_BASE_COLORS[model])
+            ax.plot(d["frequency_ghz"], d["nmae_gap"], marker="o", linewidth=2, color=color, label=model)
+        ax.axhline(0, color="black", linewidth=1, alpha=0.5)
+        ax.set_xlabel("Frequency (GHz)")
+        ax.set_ylabel("Heldout NMAE - Normal NMAE")
+        ax.set_title(f"Zero-Shot Generalization Gap | {int(util*100)}% Utilization")
+        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"{prefix}_nmae_gap_by_frequency_U{int(util*100)}.png", dpi=220)
+        if plot_show:
+            plt.show()
+        plt.close(fig)
+
+    if "nmae_normal" in merged.columns and "nmae_heldout" in merged.columns:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5.2), sharey=True)
+        for ax, mode in zip(axes, ["normal", "heldout"]):
+            for model in sorted(merged["model_type"].unique()):
+                d = merged[merged["model_type"] == model].sort_values("frequency")
+                color = None
+                if MODEL_BASE_COLORS is not None and model in MODEL_BASE_COLORS:
+                    color, _, _ = color_variants(MODEL_BASE_COLORS[model])
+                ax.plot(d["frequency_ghz"], d[f"nmae_{mode}"], marker="o", linewidth=2, color=color, label=model)
+            ax.set_title("Normal Test" if mode == "normal" else "Heldout Zero-Shot")
+            ax.set_xlabel("Frequency (GHz)")
+            ax.grid(True, alpha=0.3)
+        axes[0].set_ylabel("NMAE")
+        axes[1].legend(frameon=False)
+        fig.suptitle(f"NMAE by Frequency | {int(util*100)}% Utilization", fontsize=14)
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
+        fig.savefig(out_dir / f"{prefix}_nmae_by_frequency_U{int(util*100)}.png", dpi=220)
+        if plot_show:
+            plt.show()
+        plt.close(fig)
+    return summary
+
+
+def plot_heldout_from_logs(
+    normal_csv_path: Path,
+    normal_pred_csv_path: Path,
+    heldout_csv_path: Path,
+    heldout_pred_csv_path: Path,
+    out_dir: Path,
+    experiment_id: str | None,
+    title: str = "",
+    MODEL_BASE_COLORS=None,
+    plot_show: bool = False,
+    util: float = 1.0,
+):
+    out_dir = Path(out_dir)
+    heldout_dir = out_dir / "heldout"
+    comparison_dir = out_dir / "heldout_comparison"
+    plot_utilization_from_logs(
+        csv_path=Path(heldout_csv_path),
+        pred_csv_path=Path(heldout_pred_csv_path) if heldout_pred_csv_path and Path(heldout_pred_csv_path).exists() else None,
+        out_dir=heldout_dir,
+        experiment_id=experiment_id,
+        title=(title + " | Heldout zero-shot").strip(),
+        MODEL_BASE_COLORS=MODEL_BASE_COLORS,
+        plot_show=plot_show,
+    )
+    summary = plot_heldout_comparison(
+        normal_csv_path=Path(normal_csv_path),
+        heldout_csv_path=Path(heldout_csv_path),
+        out_dir=comparison_dir,
+        experiment_id=experiment_id,
+        util=util,
+        MODEL_BASE_COLORS=MODEL_BASE_COLORS,
+        plot_show=plot_show,
+    )
+    return summary
 
 
 def plot_utilization_from_logs(csv_path: Path,  pred_csv_path: Path, out_dir: Path, experiment_id: str | None, title: str = "", MODEL_BASE_COLORS=None, plot_show: bool = False):

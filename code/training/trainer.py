@@ -1,15 +1,21 @@
-# code/training/trainer.py
-"""Training-time helpers for evaluation and model persistence."""
+# training/trainer.py
 
+import json
 import os
+import time
 import numpy as np
 from utils.metrics import smape
 
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, mean_squared_error
 
-# Evaluate predictions with the metrics requested in the config.
+# -------------------------------------------------------------------------
+# Compute regression metrics
+# -------------------------------------------------------------------------
 def compute_test_metrics_dict(y_true, y_pred, metrics):
-    """Compute the requested regression metrics for a test prediction batch."""
+    """
+    Compute test metrics defined in config.metrics.
+    Returns: dict(metric_name -> value)
+    """
     out = {}
     for m in metrics:
         if m == "mae":
@@ -18,10 +24,11 @@ def compute_test_metrics_dict(y_true, y_pred, metrics):
             out["mape"] = mean_absolute_percentage_error(y_true, y_pred) * 100.0
         elif m == "rmse":
             out["rmse"] = np.sqrt(mean_squared_error(y_true, y_pred))
+            # out["rmse"] = mean_squared_error(y_true, y_pred, squared=False)
         elif m == "smape":
             out["smape"] = smape(y_true, y_pred)
         elif m == "nmae":
-            # Normalize MAE by the target range for the current evaluation slice.
+            # Normalized MAE: divide MAE by (max - min) of the true targets
             y_min = float(np.min(y_true))
             y_max = float(np.max(y_true))
             denom = y_max - y_min
@@ -35,10 +42,31 @@ def compute_test_metrics_dict(y_true, y_pred, metrics):
     return out
 
 
-# Save a trained Keras model to disk.
-def save_trained_model(model, path, model_name):
-    """Save a trained Keras model under the configured weights directory."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+# -------------------------------------------------------------------------
+# Compute evaluation metrics (IDENTICAL TO YOUR ORIGINAL BEHAVIOR)
+# -------------------------------------------------------------------------
+def evaluate_model(model, x_test, y_test, config):
+    y_pred = model.predict(x_test)
+    # mae, mape, rmse = compute_test_metrics_dict(y_test, y_pred)
+    metrics_out = compute_test_metrics_dict(y_test, y_pred, config.metrics)
+    return metrics_out, y_pred
+
+
+# -------------------------------------------------------------------------
+# Save Keras model to disk
+# -------------------------------------------------------------------------
+def save_trained_model(model, path, model_name, metadata=None):
+    os.makedirs(path, exist_ok=True)
     full_path = os.path.join(path, f"{model_name}.keras")
     model.save(full_path)
+    if metadata is not None:
+        meta_path = os.path.join(path, f"{model_name}.meta.json")
+        metadata_out = {
+            "schema_version": "model_weight_meta_v1",
+            "saved_at_unix": time.time(),
+            "model_file": os.path.basename(full_path),
+            **metadata,
+        }
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(metadata_out, handle, indent=2)
     return f"Model '{model_name}' saved to: {full_path}"
